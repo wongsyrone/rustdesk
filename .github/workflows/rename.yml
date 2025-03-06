@@ -1,0 +1,222 @@
+name: Sync Upstream and Rename
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # daily at 03:00 UTC — adjust as you like
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository URL'
+        required: false
+        default: 'https://github.com/rustdesk/rustdesk.git'
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        default: 'master'
+      rename_target_pkg_name:
+        description: 'Package name to rename com.carriez.flutter_hbb to'
+        required: false
+        default: 'com.wongsyrone.rd.app'
+
+concurrency:
+  group: upstream-sync-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'https://github.com/rustdesk/rustdesk.git' }}
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'master' }}
+  RENAME_COMMIT_MARKER: 'chore: reapply package rename [automated]'
+  INIT_WORKFLOW_COMMIT_MARKER: 'chore: add upstream sync workflow [infra]'
+  RENAME_TARGET_PKG_NAME: ${{ github.event.inputs.rename_target_pkg_name || 'com.wongsyrone.rd.app' }}
+  BOT_EMAIL: 'github-actions[bot]@users.noreply.github.com'
+  CONFLICT_LABEL: 'sync-rebase-conflict'
+  MANUAL_COMMITS_LABEL: 'sync-manual-commits'
+
+jobs:
+  sync-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email "$BOT_EMAIL"
+
+      - name: Ensure required labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "$CONFLICT_LABEL" \
+            --repo "${{ github.repository }}" \
+            --color D93F0B \
+            --description "Automated upstream rebase hit a conflict and needs manual resolution" \
+            --force
+
+          gh label create "$MANUAL_COMMITS_LABEL" \
+            --repo "${{ github.repository }}" \
+            --color FBCA04 \
+            --description "A manually authored commit was carried through the automated sync" \
+            --force
+
+      - name: Capture pre-sync tree hash
+        id: pre_sync
+        run: echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Drop previous automated rename commit(s), wherever they are
+        run: |
+          # Repeatedly find any commit in our local-only range (ahead of
+          # upstream) authored by the bot with the exact rename marker
+          # message, and drop it via `rebase --onto`, which works no matter
+          # where in the range that commit sits — not just at the tip.
+          while true; do
+            marker_hash=""
+            for c in $(git rev-list "upstream/$UPSTREAM_BRANCH..HEAD"); do
+              msg="$(git log -1 --pretty=%B "$c")"
+              email="$(git log -1 --pretty=%ae "$c")"
+              if [ "$email" = "$BOT_EMAIL" ] && [ "$msg" = "$RENAME_COMMIT_MARKER" ]; then
+                marker_hash="$c"
+                break
+              fi
+            done
+
+            if [ -z "$marker_hash" ]; then
+              break
+            fi
+
+            echo "Dropping automated rename commit $marker_hash"
+            git rebase --onto "${marker_hash}^" "$marker_hash"
+          done
+
+      - name: Detect manual (non-automated, non-infra) commits
+        id: manual
+        run: |
+          manual_commits="$(git log --pretty=format:'%H%x09%ae%x09%s' "upstream/$UPSTREAM_BRANCH..HEAD" \
+            | awk -F'\t' \
+                -v bot_email="$BOT_EMAIL" \
+                -v rename_marker="$RENAME_COMMIT_MARKER" \
+                -v init_marker="$INIT_WORKFLOW_COMMIT_MARKER" \
+              '{
+                 is_rename = ($2 == bot_email && $3 == rename_marker)
+                 is_init   = ($3 == init_marker)
+                 if (!is_rename && !is_init) print $1" "$2" "$3
+               }')"
+
+          if [ -n "$manual_commits" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "list<<EOF"
+              echo "$manual_commits"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase onto upstream
+        id: rebase
+        continue-on-error: true
+        run: git rebase "upstream/$UPSTREAM_BRANCH"
+
+      - name: Abort rebase on failure
+        if: steps.rebase.outcome == 'failure'
+        run: git rebase --abort
+
+      - name: Report rebase conflict
+        if: steps.rebase.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::error::Rebase conflict against $UPSTREAM_BRANCH — aborted, branch left untouched."
+
+          body="Automated rebase against \`upstream/$UPSTREAM_BRANCH\` failed with a conflict on $(date -u +%Y-%m-%dT%H:%MZ).
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          The branch was left untouched (rebase aborted). This needs a manual rebase and conflict resolution locally, then a force-push."
+
+          existing_issue="$(gh issue list --repo "${{ github.repository }}" --label "$CONFLICT_LABEL" --state open --json number --jq '.[0].number')"
+
+          if [ -n "$existing_issue" ]; then
+            gh issue comment "$existing_issue" --repo "${{ github.repository }}" --body "$body"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "⚠️ Upstream rebase conflict" \
+              --body "$body" \
+              --label "$CONFLICT_LABEL"
+          fi
+
+          exit 1
+
+      - name: Reapply rename over any new upstream files
+        run: |
+          find flutter/ -type f -exec sed -i "s/com.carriez.flutter_hbb/${RENAME_TARGET_PKG_NAME}/g" {} +
+
+      - name: Commit rename
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No rename changes needed after rebase"
+          else
+            git commit -m "$RENAME_COMMIT_MARKER"
+          fi
+
+      - name: Determine if push is needed
+        id: push_check
+        run: |
+          current_tree="$(git rev-parse HEAD^{tree})"
+          if [ "$current_tree" != "${{ steps.pre_sync.outputs.tree }}" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force push (rebase rewrites history)
+        if: steps.push_check.outputs.needed == 'true'
+        run: git push --force-with-lease origin HEAD:${{ github.ref_name }}
+
+      - name: Warn about carried manual commits
+        if: steps.manual.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_LIST: ${{ steps.manual.outputs.list }}
+        run: |
+          echo "::warning::Manual commits were rebased and pushed alongside the automated sync. Review them."
+          {
+            echo "## ⚠️ Manual commits carried through upstream sync"
+            echo ""
+            echo "$COMMIT_LIST"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          body="Sync on $(date -u +%Y-%m-%dT%H:%MZ) rebased and pushed the following manual commit(s) on \`${{ github.ref_name }}\`:
+
+          \`\`\`
+          $COMMIT_LIST
+          \`\`\`
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          existing_issue="$(gh issue list --repo "${{ github.repository }}" --label "$MANUAL_COMMITS_LABEL" --state open --json number --jq '.[0].number')"
+
+          if [ -n "$existing_issue" ]; then
+            gh issue comment "$existing_issue" --repo "${{ github.repository }}" --body "$body"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "⚠️ Manual commits carried during upstream sync" \
+              --body "$body" \
+              --label "$MANUAL_COMMITS_LABEL"
+          fi
