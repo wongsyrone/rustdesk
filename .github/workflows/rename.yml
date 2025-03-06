@@ -1,0 +1,29 @@
+name: Replace and Commit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  replace-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Replace string in files
+      run: |
+        find flutter/ -type f -exec sed -i 's/com.carriez.flutter_hbb/com.wongsyrone.rd.app/g' {} +
+
+    - name: Commit changes
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add .
+        git commit -m 'Automated replacement of com.carriez.flutter_hbb with com.wongsyrone.rd.app'
+
+    - name: Push changes
+      uses: ad-m/github-push-action@v0.6.0
+      with:
+        branch: ${{ github.ref }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
