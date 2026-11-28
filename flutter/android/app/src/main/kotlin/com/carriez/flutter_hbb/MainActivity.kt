@@ -1,4 +1,4 @@
-package com.carriez.flutter_hbb
+package com.wongsyrone.rd.app
 
 /**
  * Handle events from flutter
